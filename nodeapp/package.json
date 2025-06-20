@@ -1,0 +1,14 @@
+{
+  "name": "swarm-node-app",
+  "version": "1.0.0",
+  "description": "Node.js app with MongoDB and Redis for Docker Swarm",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.6.1",
+    "redis": "^4.6.7"
+  }
+}
