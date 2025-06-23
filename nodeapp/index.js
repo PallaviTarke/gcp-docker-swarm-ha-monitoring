@@ -1,14 +1,22 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const redis = require('redis');
-const app = express(), PORT = 3000;
+const express = require("express");
+const mongoose = require("mongoose");
+const app = express();
+const PORT = 3000;
 
-mongoose.connect(process.env.MONGO_URL).then(() => console.log("MongoDB connected"));
-const r = redis.createClient({url: process.env.REDIS_URL});
-r.connect().then(() => console.log("Redis connected"));
+app.use(express.json());
 
-app.get('/', async (req, res) => {
-  await r.set("page","visited");
-  res.send("Hello from Node.js!");
+mongoose.connect("mongodb://mongo1:27017/test", {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
 });
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+
+const cache = require("redis").createClient({ url: "redis://redis-master:6379" });
+cache.connect();
+
+app.post("/data", async (req, res) => {
+  const { key, value } = req.body;
+  await cache.set(key, value);
+  res.send("Data cached in Redis");
+});
+
+app.listen(PORT, () => console.log(`Node.js listening on ${PORT}`));
