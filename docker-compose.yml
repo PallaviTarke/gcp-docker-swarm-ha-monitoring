@@ -42,7 +42,7 @@ services:
   mongo2:
     image: mongo:6
     hostname: mongo2
-    command: ["--replSet", "rs0"]
+    command: ["mongod", "--bind_ip_all", "--replSet", "rs0"]
     volumes:
       - mongo2_data:/data/db
     deploy:
