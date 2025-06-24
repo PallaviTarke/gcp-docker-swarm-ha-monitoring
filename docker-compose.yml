@@ -1,8 +1,6 @@
-
 version: '3.8'
 
 services:
-
   nginx:
     image: nginx:latest
     ports:
@@ -16,6 +14,11 @@ services:
       - node
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   node:
     image: pallavitarke04/nodeapp:latest
@@ -24,13 +27,24 @@ services:
       - REDIS_URL=redis://redis-master:6379
     deploy:
       replicas: 2
+      placement:
+        constraints: [node.role == worker]
+    depends_on:
+      - mongo1
+      - mongo2
+      - redis-master
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   mongo1:
     image: mongo:6
     hostname: mongo1
-    command: ["--replSet", "rs0"]
+    command: ["mongod", "--bind_ip_all", "--replSet", "rs0"]
     volumes:
       - mongo1_data:/data/db
     deploy:
@@ -38,28 +52,66 @@ services:
         constraints: [node.hostname == swarm-manager]
     networks:
       - app-net
-
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   mongo2:
     image: mongo:6
     hostname: mongo2
-    command: ["mongod", "--bind_ip_all", "--replSet", "rs0"]
+    command: |
+      bash -c '
+        mongod --replSet rs0 --bind_ip_all &
+        until mongosh --host localhost --eval "db.runCommand({ ping: 1 })" >/dev/null 2>&1; do
+          echo "Waiting for MongoDB to start..."; sleep 2;
+        done;
+        if ! mongosh --host localhost --eval "rs.status()" | grep -q "myState"; then
+          echo "Initializing replica set...";
+          mongosh --host localhost --eval "
+            rs.initiate({
+              _id: \"rs0\",
+              members: [
+                { _id: 0, host: \"mongo1:27017\" },
+                { _id: 1, host: \"mongo2:27017\" }
+              ]
+            })
+          "
+        else
+          echo "Replica set already initialized.";
+        fi;
+        tail -f /dev/null
+      '
+
     volumes:
       - mongo2_data:/data/db
     deploy:
       placement:
         constraints: [node.hostname == swarm-worker]
+    depends_on:
+      - mongo1
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-master:
     image: redis:7
     volumes:
-      - redis_master_data:/data
+      - redis_data:/data
     deploy:
       placement:
         constraints: [node.hostname == swarm-manager]
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   redis-slave:
     image: redis:7
@@ -73,42 +125,196 @@ services:
         constraints: [node.hostname == swarm-worker]
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  vault:
-    image: vault:1.15.4
-    cap_add:
-      - IPC_LOCK
-    environment:
-      - VAULT_DEV_ROOT_TOKEN_ID=root
-      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+  redis-sentinel1:
+    image: redis:7
+    depends_on:
+      - redis-master
+    command: ["redis-server", "/etc/redis/sentinel.conf", "--sentinel"]
+    configs:
+      - source: redis_sentinel_conf
+        target: /etc/redis/sentinel.conf
+      - source: redis_sentinel_entrypoint
+        target: /redis-sentinel-entrypoint.sh
+    deploy:
+      placement:
+        constraints: [node.hostname == swarm-manager]
+    networks:
+      - app-net
+    entrypoint: ["/redis-sentinel-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "-p", "26379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-sentinel2:
+    image: redis:7
+    depends_on:
+      - redis-master
+    command: ["redis-server", "/etc/redis/sentinel.conf", "--sentinel"]
+    configs:
+      - source: redis_sentinel_conf
+        target: /etc/redis/sentinel.conf
+      - source: redis_sentinel_entrypoint
+        target: /redis-sentinel-entrypoint.sh
+    deploy:
+      placement:
+        constraints: [node.hostname == swarm-worker]
+    networks:
+      - app-net
+    entrypoint: ["/redis-sentinel-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "-p", "26379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    configs:
+      - source: gcpstack_prometheus_config
+        target: /etc/prometheus/prometheus.yml
     ports:
-      - "8200:8200"
+      - "9090:9090"
     deploy:
       placement:
         constraints: [node.role == manager]
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  backup:
-    image: pallavitarke04/backup:latest
+  grafana:
+    image: grafana/grafana:latest
     volumes:
-      - mongo1_data:/data/db
-      - /backup:/backup
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
     deploy:
-      restart_policy:
-        condition: none
       placement:
-        constraints: [node.hostname == swarm-manager]
+        constraints: [node.role == manager]
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  loki:
+    image: grafana/loki:2.9.4
+    configs:
+      - source: gcpstack_loki_config
+        target: /etc/loki/config.yaml
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/config.yaml
+    ports:
+      - "3100:3100"
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    configs:
+      - source: gcpstack_promtail_config
+        target: /etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    deploy:
+      mode: global
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mongodb_exporter:
+    image: percona/mongodb_exporter:0.40.0
+    ports:
+      - "9216:9216"
+    command:
+      - "--mongodb.uri=mongodb://mongo1:27017,mongo2:27017/admin?replicaSet=rs0"
+      - "--collect-all"
+    depends_on:
+      - mongo1
+      - mongo2
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9216/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis_exporter:
+    image: oliver006/redis_exporter:latest
+    ports:
+      - "9121:9121"
+    command:
+      - "--redis.addr=redis://redis-master:6379"
+    depends_on:
+      - redis-master
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9121/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+configs:
+  redis_sentinel_conf:
+    file: ./sentinel.conf
+  redis_sentinel_entrypoint:
+    file: ./redis-sentinel-entrypoint.sh
+  gcpstack_prometheus_config:
+    external: true
+  gcpstack_loki_config:
+    external: true
+  gcpstack_promtail_config:
+    external: true
 
 volumes:
   mongo1_data:
   mongo2_data:
-  redis_master_data:
+  redis_data:
   redis_slave_data:
-  backup_data:
+  grafana_data:
+  loki_data:
 
 networks:
   app-net:
-    external: false
+    driver: overlay
+    attachable: true
+
